@@ -96,6 +96,7 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_Transform,
     BRepBuilderAPI_Transformed,
 )
+from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
@@ -108,7 +109,7 @@ from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec, gp_XYZ
 from OCP.GProp import GProp_GProps
-from OCP.ShapeAnalysis import ShapeAnalysis_Curve
+from OCP.ShapeAnalysis import ShapeAnalysis_Curve, ShapeAnalysis_ShapeTolerance
 from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
 from OCP.ShapeFix import ShapeFix_Shape
 from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
@@ -2454,6 +2455,17 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
             topo_result = downcast(operation.Shape())
 
+            # REASON: OCC's Common op sometimes returns an empty result for
+            # solids whose faces are exactly coincident (e.g. intersecting a
+            # shape with an identical copy of itself, or a STEP import whose
+            # faces match the original only within tolerance). The interference
+            # classifier drops the coincident faces and everything between
+            # them. Retry with a fuzzy tolerance (and finally glue) before
+            # accepting an empty answer — removing this reintroduces
+            # false-empty intersections for correct, perfectly-aligned parts.
+            if isinstance(operation, BRepAlgoAPI_Common):
+                topo_result = _retry_empty_common(arg, tool, topo_result)
+
         # Clean
         if SkipClean.clean:
             upgrader = ShapeUpgrade_UnifySameDomain(topo_result, True, True, True)
@@ -3686,6 +3698,78 @@ def get_top_level_topods_shapes(
             first_level_shapes.append(current_shape)
 
     return first_level_shapes
+
+
+def _retry_empty_common(
+    arg: TopTools_ListOfShape,
+    tool: TopTools_ListOfShape,
+    topo_result: TopoDS_Shape,
+) -> TopoDS_Shape:
+    """Retry a Common (intersection) operation that produced an empty result.
+
+    OCC's boolean Common sometimes returns an empty compound when argument and
+    tool faces are exactly coincident — intersecting a shape with an aligned
+    copy of itself is the canonical trigger. When the plain operation came back
+    empty but the inputs' bounding boxes overlap, rebuild the operation with a
+    fuzzy tolerance, then with glue mode, returning the first non-empty result.
+    A legitimately empty result (disjoint inputs) is returned unchanged.
+
+    Args:
+        arg: arguments of the failed Common operation
+        tool: tools of the failed Common operation
+        topo_result: the (empty) result of the plain Common operation
+
+    Returns:
+        TopoDS_Shape: a non-empty retry result, or the original topo_result
+    """
+    if get_top_level_topods_shapes(topo_result):
+        return topo_result  # not empty — nothing to do
+
+    # A genuinely disjoint pair produces a legitimately empty result; check
+    # bounding-box overlap before paying for any retry.
+    arg_bnd, tool_bnd = Bnd_Box(), Bnd_Box()
+    for shapes, bnd in ((arg, arg_bnd), (tool, tool_bnd)):
+        for shape in shapes:
+            BRepBndLib.Add_s(shape, bnd)
+    if arg_bnd.IsVoid() or tool_bnd.IsVoid() or arg_bnd.IsOut(tool_bnd):
+        return topo_result
+
+    # REASON: the fuzzy value must exceed the largest tolerance already baked
+    # into the inputs (STEP imports commonly carry 1e-4 or worse) or OCC will
+    # still consider the coincident faces ambiguous; TOLERANCE is the floor
+    # for clean native geometry. Mode 1 = maximum over all sub-shapes.
+    tolerance_analyzer = ShapeAnalysis_ShapeTolerance()
+    max_tolerance = TOLERANCE
+    for shapes in (arg, tool):
+        for shape in shapes:
+            max_tolerance = max(max_tolerance, tolerance_analyzer.Tolerance(shape, 1))
+
+    for use_glue in (False, True):
+        retry_op = BRepAlgoAPI_Common()
+        retry_op.SetArguments(arg)
+        retry_op.SetTools(tool)
+        retry_op.SetRunParallel(True)
+        # REASON: fuzzy booleans may enlarge the tolerances of the *input*
+        # shapes as a side effect; NonDestructive makes OCC copy them first so
+        # the caller's shapes aren't mutated by a retry they never asked for.
+        retry_op.SetNonDestructive(True)
+        retry_op.SetFuzzyValue(max_tolerance)
+        if use_glue:
+            # REASON: glue mode skips the face-face intersection step entirely,
+            # which is only valid when faces are either fully coincident or
+            # not interfering at all — exactly the situation left when the
+            # fuzzy retry above still came back empty. Do not "simplify" this
+            # into the first attempt: glue gives wrong results for partially
+            # overlapping faces.
+            retry_op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueFull)
+        retry_op.Build()
+        if not retry_op.IsDone():
+            continue
+        retry_result = downcast(retry_op.Shape())
+        if get_top_level_topods_shapes(retry_result):
+            return retry_result
+
+    return topo_result
 
 
 def shapetype(obj: TopoDS_Shape | None) -> TopAbs_ShapeEnum:
