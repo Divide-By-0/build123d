@@ -2460,8 +2460,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
             # shape with an identical copy of itself, or a STEP import whose
             # faces match the original only within tolerance). The interference
             # classifier drops the coincident faces and everything between
-            # them. Retry with a fuzzy tolerance (and finally glue) before
-            # accepting an empty answer — removing this reintroduces
+            # them. Retry the narrow solid/solid case with a fuzzy tolerance
+            # before accepting an empty answer — removing this reintroduces
             # false-empty intersections for correct, perfectly-aligned parts.
             if isinstance(operation, BRepAlgoAPI_Common):
                 topo_result = _retry_empty_common(arg, tool, topo_result)
@@ -3709,10 +3709,11 @@ def _retry_empty_common(
 
     OCC's boolean Common sometimes returns an empty compound when argument and
     tool faces are exactly coincident — intersecting a shape with an aligned
-    copy of itself is the canonical trigger. When the plain operation came back
-    empty but the inputs' bounding boxes overlap, rebuild the operation with a
-    fuzzy tolerance, then with glue mode, returning the first non-empty result.
-    A legitimately empty result (disjoint inputs) is returned unchanged.
+    copy of itself is the canonical trigger. Only a single solid on each side
+    is eligible, and their bounding boxes must overlap with positive extent in
+    every axis. The retry uses fuzzy tolerance but never glue mode: glue can
+    fabricate intersections for partially overlapping or crossing inputs.
+    Legitimately empty and lower-dimensional results are returned unchanged.
 
     Args:
         arg: arguments of the failed Common operation
@@ -3725,13 +3726,16 @@ def _retry_empty_common(
     if get_top_level_topods_shapes(topo_result):
         return topo_result  # not empty — nothing to do
 
-    # A genuinely disjoint pair produces a legitimately empty result; check
-    # bounding-box overlap before paying for any retry.
-    arg_bnd, tool_bnd = Bnd_Box(), Bnd_Box()
-    for shapes, bnd in ((arg, arg_bnd), (tool, tool_bnd)):
-        for shape in shapes:
-            BRepBndLib.Add_s(shape, bnd)
-    if arg_bnd.IsVoid() or tool_bnd.IsVoid() or arg_bnd.IsOut(tool_bnd):
+    # The false-empty case this works around is solid against solid. Common is
+    # also a hot-path primitive for edge/face crossing and touch detection;
+    # retrying those legitimate empty results is both expensive and can change
+    # their dimensional semantics.
+    if arg.Extent() != 1 or tool.Extent() != 1:
+        return topo_result
+    arg_shape, tool_shape = downcast(arg.First()), downcast(tool.First())
+    if not isinstance(arg_shape, TopoDS_Solid) or not isinstance(
+        tool_shape, TopoDS_Solid
+    ):
         return topo_result
 
     # REASON: the fuzzy value must exceed the largest tolerance already baked
@@ -3739,34 +3743,48 @@ def _retry_empty_common(
     # still consider the coincident faces ambiguous; TOLERANCE is the floor
     # for clean native geometry. Mode 1 = maximum over all sub-shapes.
     tolerance_analyzer = ShapeAnalysis_ShapeTolerance()
-    max_tolerance = TOLERANCE
-    for shapes in (arg, tool):
-        for shape in shapes:
-            max_tolerance = max(max_tolerance, tolerance_analyzer.Tolerance(shape, 1))
+    max_tolerance = max(
+        TOLERANCE,
+        tolerance_analyzer.Tolerance(arg_shape, 1),
+        tolerance_analyzer.Tolerance(tool_shape, 1),
+    )
 
-    for use_glue in (False, True):
-        retry_op = BRepAlgoAPI_Common()
-        retry_op.SetArguments(arg)
-        retry_op.SetTools(tool)
-        retry_op.SetRunParallel(True)
-        # REASON: fuzzy booleans may enlarge the tolerances of the *input*
-        # shapes as a side effect; NonDestructive makes OCC copy them first so
-        # the caller's shapes aren't mutated by a retry they never asked for.
-        retry_op.SetNonDestructive(True)
-        retry_op.SetFuzzyValue(max_tolerance)
-        if use_glue:
-            # REASON: glue mode skips the face-face intersection step entirely,
-            # which is only valid when faces are either fully coincident or
-            # not interfering at all — exactly the situation left when the
-            # fuzzy retry above still came back empty. Do not "simplify" this
-            # into the first attempt: glue gives wrong results for partially
-            # overlapping faces.
-            retry_op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueFull)
-        retry_op.Build()
-        if not retry_op.IsDone():
-            continue
+    # Bounding boxes include each shape's tolerance, so face-touching solids
+    # can appear to overlap by roughly twice that tolerance. Require more than
+    # that padding in every axis before paying for a retry.
+    arg_bnd, tool_bnd = Bnd_Box(), Bnd_Box()
+    BRepBndLib.Add_s(arg_shape, arg_bnd)
+    BRepBndLib.Add_s(tool_shape, tool_bnd)
+    if arg_bnd.IsVoid() or tool_bnd.IsVoid() or arg_bnd.IsOut(tool_bnd):
+        return topo_result
+    arg_min, arg_max = arg_bnd.CornerMin(), arg_bnd.CornerMax()
+    tool_min, tool_max = tool_bnd.CornerMin(), tool_bnd.CornerMax()
+    overlaps = (
+        min(arg_max.X(), tool_max.X()) - max(arg_min.X(), tool_min.X()),
+        min(arg_max.Y(), tool_max.Y()) - max(arg_min.Y(), tool_min.Y()),
+        min(arg_max.Z(), tool_max.Z()) - max(arg_min.Z(), tool_min.Z()),
+    )
+    if any(overlap <= 2 * max_tolerance for overlap in overlaps):
+        return topo_result
+
+    retry_op = BRepAlgoAPI_Common()
+    retry_op.SetArguments(arg)
+    retry_op.SetTools(tool)
+    retry_op.SetRunParallel(True)
+    # REASON: fuzzy booleans may enlarge the tolerances of the *input* shapes
+    # as a side effect; NonDestructive makes OCC copy them first so the caller's
+    # shapes aren't mutated by a retry they never asked for.
+    retry_op.SetNonDestructive(True)
+    retry_op.SetFuzzyValue(max_tolerance)
+    retry_op.Build()
+    if retry_op.IsDone():
         retry_result = downcast(retry_op.Shape())
-        if get_top_level_topods_shapes(retry_result):
+        retry_shapes = get_top_level_topods_shapes(retry_result)
+        # Solid/solid Common may legitimately be empty, but it must never turn
+        # into a face, edge, or vertex merely because fuzzy mode was enabled.
+        if retry_shapes and all(
+            isinstance(shape, TopoDS_Solid) for shape in retry_shapes
+        ):
             return retry_result
 
     return topo_result

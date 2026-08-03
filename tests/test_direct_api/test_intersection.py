@@ -1095,20 +1095,35 @@ class TestCoincidentSolidIntersect:
         )
         assert not get_top_level_topods_shapes(result)
 
-    def test_retry_leaves_face_touching_empty(self):
-        from OCP.TopAbs import TopAbs_ShapeEnum
-        from build123d.topology.shape_core import (
-            _retry_empty_common,
-            get_top_level_topods_shapes,
+    def test_retry_leaves_face_touching_empty(self, monkeypatch):
+        from build123d.topology import shape_core
+
+        monkeypatch.setattr(
+            shape_core,
+            "BRepAlgoAPI_Common",
+            lambda: pytest.fail("face-touching solids must not be retried"),
         )
 
         box_a = Solid.make_box(10, 10, 10)
         box_b = Solid.make_box(10, 10, 10).moved(Location((10, 0, 0)))
-        result = _retry_empty_common(
+        result = shape_core._retry_empty_common(
             self._shape_list(box_a), self._shape_list(box_b), self._empty_compound()
         )
-        # No interior overlap: fuzzy/glue retries must not invent material
-        assert sum(
-            Solid(s).volume if s.ShapeType() == TopAbs_ShapeEnum.TopAbs_SOLID else 0
-            for s in get_top_level_topods_shapes(result)
-        ) == pytest.approx(0, abs=1e-9)
+        # No interior overlap: the retry must not invent a face or material.
+        assert not shape_core.get_top_level_topods_shapes(result)
+
+    def test_retry_leaves_crossing_faces_empty(self, monkeypatch):
+        from build123d.topology import shape_core
+
+        monkeypatch.setattr(
+            shape_core,
+            "BRepAlgoAPI_Common",
+            lambda: pytest.fail("face intersections must not be retried"),
+        )
+
+        face_a = Rectangle(10, 10).face()
+        face_b = Rectangle(10, 10).face().rotate(Axis.X, 90)
+        result = shape_core._retry_empty_common(
+            self._shape_list(face_a), self._shape_list(face_b), self._empty_compound()
+        )
+        assert not shape_core.get_top_level_topods_shapes(result)
