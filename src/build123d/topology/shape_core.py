@@ -73,7 +73,7 @@ import OCP.GeomAbs as ga
 import OCP.TopAbs as ta
 from anytree import NodeMixin, RenderTree
 from IPython.lib.pretty import RepresentationPrinter, pretty
-from OCP.Bnd import Bnd_Box, Bnd_OBB
+from OCP.Bnd import Bnd_OBB
 from OCP.BOPAlgo import BOPAlgo_GlueEnum
 from OCP.BRep import BRep_TEdge, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
@@ -96,6 +96,7 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_Transform,
     BRepBuilderAPI_Transformed,
 )
+from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
@@ -108,7 +109,7 @@ from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec, gp_XYZ
 from OCP.GProp import GProp_GProps
-from OCP.ShapeAnalysis import ShapeAnalysis_Curve
+from OCP.ShapeAnalysis import ShapeAnalysis_Curve, ShapeAnalysis_ShapeTolerance
 from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
 from OCP.ShapeFix import ShapeFix_Shape
 from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
@@ -1215,10 +1216,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         Returns:
             BoundBox: A box sized to contain this Shape
         """
-        if self._wrapped is None:
-            return BoundBox(Bnd_Box())
-        tolerance = TOLERANCE if tolerance is None else tolerance
-        return BoundBox.from_topo_ds(self.wrapped, tolerance=tolerance, optimal=optimal)
+        return BoundBox(self, tolerance=tolerance, optimal=optimal)
 
     # Actually creating the abstract method causes the subclass to pass center_of
     # even when not required - possibly this could be improved.
@@ -2454,6 +2452,17 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
             topo_result = downcast(operation.Shape())
 
+            # REASON: OCC's Common op sometimes returns an empty result for
+            # solids whose faces are exactly coincident (e.g. intersecting a
+            # shape with an identical copy of itself, or a STEP import whose
+            # faces match the original only within tolerance). The interference
+            # classifier drops the coincident faces and everything between
+            # them. Retry the narrow solid/solid case with a fuzzy tolerance
+            # before accepting an empty answer — removing this reintroduces
+            # false-empty intersections for correct, perfectly-aligned parts.
+            if isinstance(operation, BRepAlgoAPI_Common):
+                topo_result = _retry_empty_common(arg, tool, topo_result)
+
         # Clean
         if SkipClean.clean:
             upgrader = ShapeUpgrade_UnifySameDomain(topo_result, True, True, True)
@@ -3686,6 +3695,96 @@ def get_top_level_topods_shapes(
             first_level_shapes.append(current_shape)
 
     return first_level_shapes
+
+
+def _retry_empty_common(
+    arg: TopTools_ListOfShape,
+    tool: TopTools_ListOfShape,
+    topo_result: TopoDS_Shape,
+) -> TopoDS_Shape:
+    """Retry a Common (intersection) operation that produced an empty result.
+
+    OCC's boolean Common sometimes returns an empty compound when argument and
+    tool faces are exactly coincident — intersecting a shape with an aligned
+    copy of itself is the canonical trigger. Only a single solid on each side
+    is eligible, and their bounding boxes must overlap with positive extent in
+    every axis. The retry uses fuzzy tolerance but never glue mode: glue can
+    fabricate intersections for partially overlapping or crossing inputs.
+    Legitimately empty and lower-dimensional results are returned unchanged.
+
+    Args:
+        arg: arguments of the failed Common operation
+        tool: tools of the failed Common operation
+        topo_result: the (empty) result of the plain Common operation
+
+    Returns:
+        TopoDS_Shape: a non-empty retry result, or the original topo_result
+    """
+    if get_top_level_topods_shapes(topo_result):
+        return topo_result  # not empty — nothing to do
+
+    # The false-empty case this works around is solid against solid. Common is
+    # also a hot-path primitive for edge/face crossing and touch detection;
+    # retrying those legitimate empty results is both expensive and can change
+    # their dimensional semantics.
+    if arg.Extent() != 1 or tool.Extent() != 1:
+        return topo_result
+    arg_shape, tool_shape = downcast(arg.First()), downcast(tool.First())
+    if not isinstance(arg_shape, TopoDS_Solid) or not isinstance(
+        tool_shape, TopoDS_Solid
+    ):
+        return topo_result
+
+    # REASON: the fuzzy value must exceed the largest tolerance already baked
+    # into the inputs (STEP imports commonly carry 1e-4 or worse) or OCC will
+    # still consider the coincident faces ambiguous; TOLERANCE is the floor
+    # for clean native geometry. Mode 1 = maximum over all sub-shapes.
+    tolerance_analyzer = ShapeAnalysis_ShapeTolerance()
+    max_tolerance = max(
+        TOLERANCE,
+        tolerance_analyzer.Tolerance(arg_shape, 1),
+        tolerance_analyzer.Tolerance(tool_shape, 1),
+    )
+
+    # Bounding boxes include each shape's tolerance, so face-touching solids
+    # can appear to overlap by roughly twice that tolerance. Require more than
+    # that padding in every axis before paying for a retry.
+    arg_bnd, tool_bnd = Bnd_Box(), Bnd_Box()
+    BRepBndLib.Add_s(arg_shape, arg_bnd)
+    BRepBndLib.Add_s(tool_shape, tool_bnd)
+    if arg_bnd.IsVoid() or tool_bnd.IsVoid() or arg_bnd.IsOut(tool_bnd):
+        return topo_result
+    arg_min, arg_max = arg_bnd.CornerMin(), arg_bnd.CornerMax()
+    tool_min, tool_max = tool_bnd.CornerMin(), tool_bnd.CornerMax()
+    overlaps = (
+        min(arg_max.X(), tool_max.X()) - max(arg_min.X(), tool_min.X()),
+        min(arg_max.Y(), tool_max.Y()) - max(arg_min.Y(), tool_min.Y()),
+        min(arg_max.Z(), tool_max.Z()) - max(arg_min.Z(), tool_min.Z()),
+    )
+    if any(overlap <= 2 * max_tolerance for overlap in overlaps):
+        return topo_result
+
+    retry_op = BRepAlgoAPI_Common()
+    retry_op.SetArguments(arg)
+    retry_op.SetTools(tool)
+    retry_op.SetRunParallel(True)
+    # REASON: fuzzy booleans may enlarge the tolerances of the *input* shapes
+    # as a side effect; NonDestructive makes OCC copy them first so the caller's
+    # shapes aren't mutated by a retry they never asked for.
+    retry_op.SetNonDestructive(True)
+    retry_op.SetFuzzyValue(max_tolerance)
+    retry_op.Build()
+    if retry_op.IsDone():
+        retry_result = downcast(retry_op.Shape())
+        retry_shapes = get_top_level_topods_shapes(retry_result)
+        # Solid/solid Common may legitimately be empty, but it must never turn
+        # into a face, edge, or vertex merely because fuzzy mode was enabled.
+        if retry_shapes and all(
+            isinstance(shape, TopoDS_Solid) for shape in retry_shapes
+        ):
+            return retry_result
+
+    return topo_result
 
 
 def shapetype(obj: TopoDS_Shape | None) -> TopAbs_ShapeEnum:

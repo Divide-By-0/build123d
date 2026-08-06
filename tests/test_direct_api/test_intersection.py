@@ -1032,3 +1032,98 @@ class TestEmptyCompoundIntersect:
         face = Rectangle(2, 2).face()
         result = empty.intersect(face)
         assert result is None
+
+
+class TestCoincidentSolidIntersect:
+    """Intersections of exactly coincident solids must not come back empty.
+
+    OCC's Common op sometimes returns an empty result for two solids sitting
+    exactly on top of each other; _retry_empty_common in shape_core recovers
+    from that. The false-empty is not reproducible on every OCC build, so the
+    retry helper is also exercised directly with a simulated empty result.
+    """
+
+    @staticmethod
+    def _empty_compound():
+        from OCP.TopoDS import TopoDS_Compound
+        from OCP.BRep import BRep_Builder
+
+        compound = TopoDS_Compound()
+        BRep_Builder().MakeCompound(compound)
+        return compound
+
+    @staticmethod
+    def _shape_list(*shapes):
+        from OCP.TopTools import TopTools_ListOfShape
+
+        result = TopTools_ListOfShape()
+        for shape in shapes:
+            result.Append(shape.wrapped)
+        return result
+
+    def test_coincident_solids_intersect_full_volume(self):
+        box = Solid.make_box(10, 10, 10)
+        result = box.intersect(Solid.make_box(10, 10, 10))
+        assert result is not None
+        assert sum(s.volume for s in result) == pytest.approx(1000, rel=1e-6)
+
+    def test_retry_recovers_simulated_empty_common(self):
+        from build123d.topology.shape_core import (
+            _retry_empty_common,
+            get_top_level_topods_shapes,
+        )
+
+        box_a = Solid.make_box(10, 10, 10)
+        box_b = Solid.make_box(10, 10, 10)
+        recovered = _retry_empty_common(
+            self._shape_list(box_a), self._shape_list(box_b), self._empty_compound()
+        )
+        solids = get_top_level_topods_shapes(recovered)
+        assert solids
+        assert sum(Solid(s).volume for s in solids) == pytest.approx(1000, rel=1e-6)
+
+    def test_retry_leaves_disjoint_empty(self):
+        from build123d.topology.shape_core import (
+            _retry_empty_common,
+            get_top_level_topods_shapes,
+        )
+
+        box_a = Solid.make_box(10, 10, 10)
+        box_b = Solid.make_box(10, 10, 10).moved(Location((100, 0, 0)))
+        result = _retry_empty_common(
+            self._shape_list(box_a), self._shape_list(box_b), self._empty_compound()
+        )
+        assert not get_top_level_topods_shapes(result)
+
+    def test_retry_leaves_face_touching_empty(self, monkeypatch):
+        from build123d.topology import shape_core
+
+        monkeypatch.setattr(
+            shape_core,
+            "BRepAlgoAPI_Common",
+            lambda: pytest.fail("face-touching solids must not be retried"),
+        )
+
+        box_a = Solid.make_box(10, 10, 10)
+        box_b = Solid.make_box(10, 10, 10).moved(Location((10, 0, 0)))
+        result = shape_core._retry_empty_common(
+            self._shape_list(box_a), self._shape_list(box_b), self._empty_compound()
+        )
+        # No interior overlap: the retry must not invent a face or material.
+        assert not shape_core.get_top_level_topods_shapes(result)
+
+    def test_retry_leaves_crossing_faces_empty(self, monkeypatch):
+        from build123d.topology import shape_core
+
+        monkeypatch.setattr(
+            shape_core,
+            "BRepAlgoAPI_Common",
+            lambda: pytest.fail("face intersections must not be retried"),
+        )
+
+        face_a = Rectangle(10, 10).face()
+        face_b = Rectangle(10, 10).face().rotate(Axis.X, 90)
+        result = shape_core._retry_empty_common(
+            self._shape_list(face_a), self._shape_list(face_b), self._empty_compound()
+        )
+        assert not shape_core.get_top_level_topods_shapes(result)
